@@ -9,6 +9,7 @@ import (
 	"myGprc/codec"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -64,27 +65,39 @@ func (m *methodType) newReplyv() reflect.Value {
 	return replyv
 }
 
+// Server represents a RPC server
 type Server struct {
-	name   string
-	typ    reflect.Type
-	rcvr   reflect.Value
-	method map[string]*methodType
+	serviceMap sync.Map //并发安全的万能map
 }
 
-func NewServer(rcv any) *Server {
-	s := new(Server)
+type service struct {
+	name      string
+	typ       reflect.Type
+	rcvr      reflect.Value //调用的时候作为参数，如rcvr.<Method>
+	methodMap map[string]*methodType
+}
+
+func NewServer() *Server {
+	return &Server{}
+}
+
+func NewService(rcv interface{}) *service {
+	s := new(service)
 	s.rcvr = reflect.ValueOf(rcv)
 	s.name = reflect.Indirect(s.rcvr).Type().Name()
 	s.typ = reflect.TypeOf(rcv)
+
 	if !ast.IsExported(s.name) {
-		log.Fatal("rpc server: %s is not a valid server name", s.name)
+		log.Fatalf("rpc server: %s is not a valid server name", s.name)
 	}
+
 	s.registerMehods()
 	return s
 }
 
-func (s *Server) registerMehods() {
-	s.method = make(map[string]*methodType)
+// ******Service Methods
+func (s *service) registerMehods() {
+	s.methodMap = make(map[string]*methodType)
 	for i := 0; i < s.typ.NumMethod(); i++ {
 		method := s.typ.Method(i)
 		mType := method.Type
@@ -103,7 +116,7 @@ func (s *Server) registerMehods() {
 			continue
 		}
 
-		s.method[method.Name] = &methodType{
+		s.methodMap[method.Name] = &methodType{
 			method:    method,
 			ArgType:   argType,
 			ReplyType: replyType,
@@ -118,7 +131,63 @@ func isExportedOrBuiltinType(t reflect.Type) bool {
 	return ast.IsExported(t.Name()) || t.PkgPath() == ""
 }
 
-var DefaultServer = NewServer(nil)
+// 通过反射值调用方法
+func (s *service) call(m *methodType, argv, replyv reflect.Value) error {
+	//调用次数+1
+	atomic.AddUint64(&m.numCalls, 1)
+	//获取反射类型的方法
+	fuc := m.method.Func
+
+	//将参数打包成[]reflect.Value传入并获取[]reflect.Value返回值
+	returnValues := fuc.Call([]reflect.Value{s.rcvr, argv, replyv})
+	//检查error
+	if errInter := returnValues[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
+}
+
+// ********Server Methods
+var DefaultServer = NewServer()
+
+// 给server的serviceMap注册对应的service,参数为任意类型，该类型可以实现对应调度方法
+func (s *Server) Register(rcvr any) error {
+	service := NewService(rcvr)
+	if _, loaded := s.serviceMap.LoadOrStore(service.name, service); loaded {
+		return fmt.Errorf("rpc: service already defined")
+	}
+	return nil
+}
+
+// 全局Register
+func Register(rcvr any) error {
+	s := NewService(rcvr)
+	if _, loaded := DefaultServer.serviceMap.LoadOrStore(s.name, s); loaded {
+		return fmt.Errorf("rpc: service already defined")
+	}
+	return nil
+}
+
+// 通过ServiceMethod如Foo.Sum在serviceMap找对应service和对应method
+func (s *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = fmt.Errorf("rpc server: service/method required ill-formed: " + serviceMethod)
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	sv, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = fmt.Errorf("rpc server:cant find service")
+		return
+	}
+	svc = sv.(*service)
+	mtype = svc.methodMap[methodName]
+	if mtype == nil {
+		err = fmt.Errorf("rpc server:cant find method")
+	}
+
+	return
+}
 
 func (s *Server) Accept(lis net.Listener) {
 	for {
@@ -144,6 +213,7 @@ func (s *Server) Serve(conn net.Conn) {
 		log.Printf("rpc server: invalid magic number %x", opt.MagicNumber)
 		return
 	}
+
 	f := codec.NewCodeFuncMap[opt.CodecType]
 	if f == nil {
 		log.Printf("rpc server:invalid CodecType:%s", opt.CodecType)
@@ -187,8 +257,10 @@ func (s *Server) serveCodec(cc codec.Codec) {
 }
 
 type request struct {
-	h            *codec.Header
-	argv, replyv reflect.Value
+	h            *codec.Header //header of request
+	argv, replyv reflect.Value //argv and replyv of request
+	mtype        *methodType
+	svc          *service
 }
 
 // 读取请求头
@@ -216,11 +288,24 @@ func (s *Server) readRequest(cc codec.Codec) (*request, error) {
 
 	//初始化赋值给请求结构体
 	req := &request{h: h}
+	req.svc, req.mtype, err = s.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	//初始化参数实例
+	//确保argvi是个指针用来让readBody能够读取
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
 
 	//读取请求体
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err := cc.ReadBody(req.argv.Interface()); err != nil {
+	if err := cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server:read body error:", err)
+		return req, err
 	}
 	return req, nil
 }
@@ -237,28 +322,14 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 
 // 处理数据
 func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	//day1,just print argv and send a  hello message
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp%d", req.h.Seq))
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
-}
-
-// 通过反射值调用方法
-func (s *Server) call(m *methodType, argv, replyv reflect.Value) error {
-	//调用次数+1
-	atomic.AddUint64(&m.numCalls, 1)
-	//获取反射类型的方法
-	f := m.method.Func
-
-	//将参数打包成[]reflect.Value传入并获取[]reflect.Value返回值
-	returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
-	//检查error
-	if errInter := returnValues[0].Interface(); errInter != nil {
-		return errInter.(error)
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		s.sendResponse(cc, req.h, invalidRequest, sending)
 	}
-	return nil
+
+	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
