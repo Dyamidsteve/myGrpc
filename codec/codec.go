@@ -14,7 +14,7 @@ type Header struct {
 
 //消息体编解码接口
 type Codec interface {
-	io.Closer
+	io.Closer //继承接口io.Closer,来实现Close
 	ReadHeader(*Header) error
 	ReadBody(interface{}) error
 	Write(*Header, interface{}) error
@@ -30,10 +30,13 @@ const (
 	JsonType Type = "application/json" //not implemented
 )
 
+//初始化全局编码映射
 var NewCodeFuncMap map[Type]NewCodeFunc
 
 func init() {
 	NewCodeFuncMap = make(map[Type]NewCodeFunc)
+
+	//先添加gob编解码器
 	NewCodeFuncMap[GobType] = NewGobCodec
 
 }

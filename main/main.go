@@ -1,12 +1,12 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	mygrpc "myGprc"
-	"myGprc/codec"
+	"myGprc/client"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -21,30 +21,31 @@ func startServer(addr chan string) {
 }
 
 func main() {
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
 
-	conn, _ := net.Dial("tcp", <-addr)
-	defer conn.Close()
+	client, _ := client.Dial("tcp", <-addr)
+	defer client.Close()
 	//defer func() {_ = conn.Close()}()
 
 	time.Sleep(time.Second)
-	//客户端先发送options
-	_ = json.NewEncoder(conn).Encode(mygrpc.DefaultOption)
-	cc := codec.NewGobCodec(conn)
+
+	//wg控制主协程等待其他协程结束
+	var wg sync.WaitGroup
 	// 发送请求并返回消息
 	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "Foo.Sum",
-			Seq:           uint64(i),
-		}
-		//发送request
-		_ = cc.Write(h, fmt.Sprintf("mygrpc req %d", h.Seq))
-
-		//获取respons
-		_ = cc.ReadHeader(h)
-		var reply string
-		_ = cc.ReadBody(&reply)
-		log.Println("reply:", reply)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := fmt.Sprintf("geerpc req %d", i)
+			var reply string
+			if err := client.Call("Foo.Sum", args, &reply); err != nil {
+				log.Fatal("CALL Foo.Sum error:", err)
+			}
+			log.Println("reply:", reply)
+		}(i)
 	}
+
+	wg.Wait()
 }

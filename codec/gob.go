@@ -58,6 +58,7 @@ func (gc *GobCodec) Write(h *Header, body interface{}) (err error) {
 	return nil
 }
 
+// 实现Close方法，实际是io.Closer.Close()
 func (gc *GobCodec) Close() error {
 	return gc.conn.Close()
 }
