@@ -6,6 +6,8 @@ import (
 	mygrpc "myGprc"
 	"myGprc/client"
 	"net"
+	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,7 +22,34 @@ func startServer(addr chan string) {
 	mygrpc.Accept(listener)
 }
 
+func TestReflect() {
+	var wg sync.WaitGroup
+	typ := reflect.TypeOf(&wg)
+	//输出类型的每个方法名
+	for i := 0; i < typ.NumMethod(); i++ {
+		method := typ.Method(i)
+		argv := make([]string, 0, method.Type.NumIn())
+		returns := make([]string, method.Type.NumOut())
+
+		for j := 0; j < method.Type.NumIn(); j++ {
+			argv = append(argv, method.Type.In(j).Name())
+		}
+		for j := 0; j < method.Type.NumOut(); j++ {
+			returns = append(returns, method.Type.Out(j).Name())
+		}
+
+		log.Printf("func (w *%s) %s (%s) %s",
+			typ.Elem().Name(),
+			method.Name,
+			strings.Join(argv, ","),
+			strings.Join(returns, ","))
+	}
+}
+
 func main() {
+	TestReflect()
+	return
+
 	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
