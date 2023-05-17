@@ -47,8 +47,6 @@ func TestReflect() {
 }
 
 func main() {
-	TestReflect()
-	return
 
 	log.SetFlags(0)
 	addr := make(chan string)

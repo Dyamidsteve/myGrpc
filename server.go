@@ -3,12 +3,14 @@ package mygrpc
 import (
 	"encoding/json"
 	"fmt"
+	"go/ast"
 	"io"
 	"log"
 	"myGprc/codec"
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 const MagicNumber = 0x3bef5c
@@ -23,13 +25,100 @@ var DefaultOption = &Option{
 	CodecType:   codec.GobType,
 }
 
-type Server struct{}
-
-func NewServer() *Server {
-	return &Server{}
+// 定义用于反射的方法结构体
+type methodType struct {
+	method    reflect.Method //方法本身
+	ArgType   reflect.Type   //第一个参数的类型
+	ReplyType reflect.Type   //第二个参数的类型
+	numCalls  uint64         //后续统计方法调用次数
 }
 
-var DefaultServer = NewServer()
+func (m *methodType) NumCalls() uint64 {
+	return atomic.LoadUint64(&m.numCalls)
+}
+
+func (m *methodType) newArgv() reflect.Value {
+	var argv reflect.Value
+	// arg may be a pointer type,or a value type
+	if m.ArgType.Kind() == reflect.Pointer {
+		argv = reflect.New(m.ArgType.Elem())
+	} else {
+		argv = reflect.New(m.ArgType).Elem()
+	}
+
+	return argv
+}
+
+func (m *methodType) newReplyv() reflect.Value {
+	// reply musst be a pointer type
+	replyv := reflect.New(m.ReplyType.Elem())
+	switch m.ReplyType.Elem().Kind() {
+	case reflect.Map:
+		replyv.Elem().Set(reflect.MakeMap(m.ReplyType.Elem()))
+	case reflect.Slice:
+		replyv.Elem().Set(reflect.MakeSlice(m.ReplyType.Elem(), 0, 0))
+	default:
+		break
+	}
+
+	return replyv
+}
+
+type Server struct {
+	name   string
+	typ    reflect.Type
+	rcvr   reflect.Value
+	method map[string]*methodType
+}
+
+func NewServer(rcv any) *Server {
+	s := new(Server)
+	s.rcvr = reflect.ValueOf(rcv)
+	s.name = reflect.Indirect(s.rcvr).Type().Name()
+	s.typ = reflect.TypeOf(rcv)
+	if !ast.IsExported(s.name) {
+		log.Fatal("rpc server: %s is not a valid server name", s.name)
+	}
+	s.registerMehods()
+	return s
+}
+
+func (s *Server) registerMehods() {
+	s.method = make(map[string]*methodType)
+	for i := 0; i < s.typ.NumMethod(); i++ {
+		method := s.typ.Method(i)
+		mType := method.Type
+		// 入参三个是因为第0个是自身，类似于this
+		// 方法的输入参数和返回参数必须分别满足3、1
+		if mType.NumIn() != 3 || mType.NumOut() != 1 {
+			continue
+		}
+		// 方法的输出参数必须是个error类型
+		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
+			continue
+		}
+
+		argType, replyType := mType.In(1), mType.In(2)
+		if !isExportedOrBuiltinType(argType) || !isExportedOrBuiltinType(replyType) {
+			continue
+		}
+
+		s.method[method.Name] = &methodType{
+			method:    method,
+			ArgType:   argType,
+			ReplyType: replyType,
+		}
+		log.Printf("rpc server:register .%s.%s \n", s.name, method.Name)
+
+	}
+}
+
+// return true when either type's first char is upper or pkgpath is equal to ""
+func isExportedOrBuiltinType(t reflect.Type) bool {
+	return ast.IsExported(t.Name()) || t.PkgPath() == ""
+}
+
+var DefaultServer = NewServer(nil)
 
 func (s *Server) Accept(lis net.Listener) {
 	for {
@@ -154,6 +243,22 @@ func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex
 
 	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp%d", req.h.Seq))
 	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+}
+
+// 通过反射值调用方法
+func (s *Server) call(m *methodType, argv, replyv reflect.Value) error {
+	//调用次数+1
+	atomic.AddUint64(&m.numCalls, 1)
+	//获取反射类型的方法
+	f := m.method.Func
+
+	//将参数打包成[]reflect.Value传入并获取[]reflect.Value返回值
+	returnValues := f.Call([]reflect.Value{s.rcvr, argv, replyv})
+	//检查error
+	if errInter := returnValues[0].Interface(); errInter != nil {
+		return errInter.(error)
+	}
+	return nil
 }
 
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }
