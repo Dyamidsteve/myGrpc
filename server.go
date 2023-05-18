@@ -8,22 +8,33 @@ import (
 	"log"
 	"myGprc/codec"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const MagicNumber = 0x3bef5c
+const (
+	MagicNumber      = 0x3bef5c
+	DefaultTimeOut   = time.Second
+	connected        = "200 Connected to Gee RPC"
+	dafaultRPCPath   = "/_geerpc_"
+	defaultDebugPath = "/debug/geerpc"
+)
 
 type Option struct {
-	MagicNumber int        //标志这是mygrpc请求
-	CodecType   codec.Type //编解码类型，如gob或json
+	MagicNumber    int           //标志这是mygrpc请求
+	CodecType      codec.Type    //编解码类型，如gob或json
+	ConnectTimeout time.Duration //连接时长 0 means no limit
+	HandleTimeout  time.Duration //处理时长
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 // 定义用于反射的方法结构体
@@ -200,6 +211,33 @@ func (s *Server) Accept(lis net.Listener) {
 	}
 }
 
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Println("rpc hijacking ", req.RemoteAddr, ":", err)
+		return
+	}
+
+	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n")
+	s.Serve(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(dafaultRPCPath, s)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
+}
+
+// Serve func need a instanced connection to serve
 func (s *Server) Serve(conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	var opt Option
@@ -248,7 +286,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 		//处理请求是并发的，但是回复请求的报文必须是逐个发送的，
 		//并发容易导致多个回复报文交织在一起，客户端无法解析。
 		//在这里使用锁(sending)保证。
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, time.Second)
 
 	}
 	wg.Wait()
@@ -320,16 +358,47 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-// 处理数据
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+// 处理数据(并回应消息)
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	//构建两个管道，类型使用空类型，达到不传值不占内存的效果
+	called := make(chan struct{}) //called表示调用完方法
+	sent := make(chan struct{})   //sent表示发送完数据
+	defer func() {
+		//对于发送完后不再利用的管道，结束后直接关闭，防止协程异常时内存泄漏
+		close(called)
+		close(sent)
+	}()
+	go func() {
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			sent <- struct{}{}
+			return
+		}
+		s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+
+	//不限制时间则处理完退出
+	if timeout == 0 {
+		<-called
+		<-sent
+		return
 	}
 
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	select {
+	//timeout只判断处理消息时是否超时，不会判断发送消息超时
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		//处理完消息后，还需等待回应消息
+		<-sent
+	}
+
 }
 
 func Accept(lis net.Listener) { DefaultServer.Accept(lis) }

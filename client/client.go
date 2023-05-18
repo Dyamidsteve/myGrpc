@@ -1,14 +1,26 @@
 package client
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	mygrpc "myGprc"
 	"myGprc/codec"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
+)
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	dafaultRPCPath   = "/_geerpc_"
+	defaultDebugPath = "/debug/geerpc"
 )
 
 // Call承载一次RPC调度所需信息,客户端传时只需赋值
@@ -27,6 +39,56 @@ func (call *Call) done() {
 	call.Done <- call
 }
 
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *mygrpc.Option) (client *Client, err error)
+
+// 给连接封装超时机制
+// 相比开放的Dial方法，dialTimeout允许自行设置Client创建方法
+func dialTimeout(newcleFunc newClientFunc, network, addr string, opts ...*mygrpc.Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, addr, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// close the connection if client is nil
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+	}()
+
+	//相比原来的Dial，这里用chan通信，由另一个协程向管道发信息
+	//主协程阻塞等待多个channel数据到达，若超时管道先有数据则超时
+	//反之则是返回数据
+	ch := make(chan clientResult)
+	go func() {
+		client, err := newcleFunc(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+
+	//若未限制最大连接时长
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client:connect timeout")
+	case result := <-ch:
+		return result.client, result.err
+	}
+
+}
+
 // Client represents an RPC Client
 type Client struct {
 	cc       codec.Codec      //消息编解码器
@@ -40,9 +102,23 @@ type Client struct {
 	shutdown bool             //为true是有错误发生
 }
 
-var _ioCloser = (*Client)(nil)
+// var _ioCloser = (*Client)(nil)
 
 var ErrShutdown = errors.New("connection is shut down")
+
+func NewHTTPClient(conn net.Conn, opt *mygrpc.Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", dafaultRPCPath))
+
+	//require successful http response
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = fmt.Errorf("unexpected HTTP response: %s", resp.Status)
+	}
+	return nil, err
+}
 
 func (client *Client) Close() error {
 	client.mu.Lock()
@@ -185,7 +261,9 @@ func newClientCodec(cc codec.Codec, opt *mygrpc.Option) *Client {
 }
 
 // 为简化调用Dial，用户可以预设Option作为可选参数
+// 这里使用...不是为了允许设置多个，而是允许没有,即可以不输入参数，使用默认设置
 func parseOptions(opts ...*mygrpc.Option) (*mygrpc.Option, error) {
+	//用户未输入参数或输入nil则使用默认Option
 	if len(opts) == 0 || opts[0] == nil {
 		return mygrpc.DefaultOption, nil
 	}
@@ -201,25 +279,32 @@ func parseOptions(opts ...*mygrpc.Option) (*mygrpc.Option, error) {
 	return opt, nil
 }
 
-// Dial connetc to an RPC server at the specified netword
+// Dial connetc to an RPC server at the specified netword in tcp
 func Dial(network, address string, opts ...*mygrpc.Option) (client *Client, err error) {
-	opt, err := parseOptions(opts...)
-	if err != nil {
-		return nil, err
-	}
-	//example:Dial("tcp", "198.51.100.1:80")
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		if client == nil {
-			_ = conn.Close()
-		}
-	}()
+	return dialTimeout(NewClient, network, address, opts...)
+}
 
-	return NewClient(conn, opt)
+// DialHTTP connect to RPC server in HTTP
+func DialHTTP(network, addr string, opts ...*mygrpc.Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, addr, opts...)
+}
 
+// XDial calls different functions to connect to a RPC server
+// according to the first parameter rpcAddr
+// rpcAddr is a general format protocol to represent
+// eg, http@10.0.0.1:7001,tcp@10.0.0.1:9999,unix@/tmp/geerpc.sock
+func XDial(rpcAddr string, opts ...*mygrpc.Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err:wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	case "tcp":
+		return Dial("tcp", addr, opts...)
+	}
 }
 
 // 发送请求
@@ -267,12 +352,30 @@ func (client *Client) Go(serviceMethod string, args, reply any, done chan *Call)
 	}
 
 	//开辟另一个协程发送call
-	go client.send(call)
+	//go client.send(call)
+	client.send(call)
 	return call
 }
 
+// 请求调度的超时机制交给了context，由用户来判断
 // 发送请求并阻塞等待回应，返回reply和error信息,reply作为指针传参获取
-func (client *Client) Call(serviceMethod string, args, reply any) error {
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply any) error {
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return fmt.Errorf("rpc client:call failed:" + ctx.Err().Error())
+	case cl := <-call.Done:
+		return cl.Error
+
+	}
+
+	/*
+		用户可以使用 context.WithTimeout 创建具备超时检测能力的 context 对象来控制。例如：
+			ctx, _ := context.WithTimeout(context.Background(), time.Second)
+			var reply int
+			err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+			...
+	*/
+
 }

@@ -15,7 +15,6 @@ func (f Foo) Sum(args Args, reply *int) error {
 	return nil
 }
 
-// 非公开方法，测试时不能被调用
 func (f Foo) sum(args Args, reply *int) error {
 	*reply = args.Num1 + args.Num2
 	return nil
