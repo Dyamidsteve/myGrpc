@@ -4,11 +4,9 @@ import (
 	"context"
 	"log"
 	mygrpc "myGprc"
-	"myGprc/client"
+	"myGprc/xclient"
 	"net"
 	"net/http"
-	"reflect"
-	"strings"
 	"sync"
 	"time"
 )
@@ -22,7 +20,27 @@ func (f Foo) Sum(args Args, reply *int) error {
 	return nil
 }
 
-func startServer(addr chan string) {
+func (f Foo) Sleep(args Args, reply *int) error {
+	time.Sleep(time.Second * time.Duration(args.Num1))
+	*reply = args.Num1 + args.Num2
+	return nil
+}
+
+func startServer(addrCh chan string) {
+	var foo Foo
+	lis, err := net.Listen("tcp", ":0")
+	if err != nil {
+		log.Fatal("network error:", err)
+	}
+	log.Println("start rpc server on", lis.Addr())
+	addrCh <- lis.Addr().String()
+	server := mygrpc.NewServer()
+	_ = server.Register(&foo)
+	server.Accept(lis)
+
+}
+
+func startHTTPServer(addr chan string) {
 	var foo Foo
 	if err := mygrpc.Register(&foo); err != nil {
 		log.Fatal("rpc server:register error:", err)
@@ -38,6 +56,61 @@ func startServer(addr chan string) {
 	_ = http.Serve(listener, nil)
 }
 
+func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, args *Args) {
+	var reply int
+	var err error
+	switch typ {
+	case "call":
+		err = xc.Call(ctx, serviceMethod, args, &reply)
+	case "broadcast":
+		err = xc.BroadCast(ctx, serviceMethod, args, &reply)
+	}
+
+	if err != nil {
+		log.Printf("%s %s error %v", typ, serviceMethod, err)
+	} else {
+		log.Printf("%s %s success: %d + %d = %d", typ, serviceMethod, args.Num1, args.Num2, reply)
+	}
+}
+
+func call(addr1, addr2 string) {
+	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
+	defer xc.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(xc, context.Background(), "call", "Foo.Sum", &Args{Num1: i, Num2: i * i})
+			// expect 2 - 5 timeout
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+func broadcast(addr1, addr2 string) {
+	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
+	defer xc.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			foo(xc, context.Background(), "broadcast", "Foo.Sum", &Args{Num1: i, Num2: i * i})
+			ctx, _ := context.WithTimeout(context.Background(), time.Second*5)
+			foo(xc, ctx, "broadcast", "Foo.Sleep", &Args{Num1: i, Num2: i * i})
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+/*
 func TestReflect() {
 	var wg sync.WaitGroup
 	typ := reflect.TypeOf(&wg)
@@ -61,42 +134,21 @@ func TestReflect() {
 			strings.Join(returns, ","))
 	}
 }
-
-func call(addchan <-chan string) {
-	client, _ := client.DialHTTP("tcp", <-addchan)
-	defer client.Close()
-	//defer func() {_ = conn.Close()}()
-
-	time.Sleep(time.Second)
-
-	//wg控制主协程等待其他协程结束
-	var wg sync.WaitGroup
-	// 发送请求并返回消息
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			args := &Args{Num1: i, Num2: i * i}
-			var reply int
-			//ctx, _ := context.WithTimeout(context.Background(), time.Second)
-			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
-				log.Fatal("Call Foo.Sum error:", err)
-			}
-			log.Printf("%d + %d= %d \n", args.Num1, args.Num2, reply)
-		}(i)
-	}
-
-	wg.Wait()
-}
+*/
 
 func main() {
 	//TestReflect()
 
 	log.SetFlags(0)
-	addrch := make(chan string)
-	go call(addrch)
+	ch1, ch2 := make(chan string), make(chan string)
+	go startServer(ch1)
+	go startServer(ch2)
 
-	// 主协程调用server，服务启动则一直等待，若是之前子协程则客户端结束服务端也结束了
-	startServer(addrch)
+	addr1 := <-ch1
+	addr2 := <-ch2
+
+	time.Sleep(time.Second)
+	call(addr1, addr2)
+	broadcast(addr1, addr2)
 
 }

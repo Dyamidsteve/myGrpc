@@ -367,13 +367,25 @@ func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex
 	//构建两个管道，类型使用空类型，达到不传值不占内存的效果
 	called := make(chan struct{}) //called表示调用完方法
 	sent := make(chan struct{})   //sent表示发送完数据
+	var chanClosed bool = false
+	var mu sync.Mutex //控制chanClosed
+
 	defer func() {
 		//对于发送完后不再利用的管道，结束后直接关闭，防止协程异常时内存泄漏
+		mu.Lock()
+		chanClosed = true
+		mu.Unlock()
+
 		close(called)
 		close(sent)
 	}()
 	go func() {
 		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		mu.Lock()
+		defer mu.Unlock()
+		if chanClosed {
+			return
+		}
 		called <- struct{}{}
 		if err != nil {
 			req.h.Error = err.Error()
