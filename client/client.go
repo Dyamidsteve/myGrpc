@@ -302,7 +302,7 @@ func XDial(rpcAddr string, opts ...*mygrpc.Option) (*Client, error) {
 	switch protocol {
 	case "http":
 		return DialHTTP("tcp", addr, opts...)
-	case "tcp":
+	default:
 		return Dial("tcp", addr, opts...)
 	}
 }
