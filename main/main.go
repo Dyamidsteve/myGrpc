@@ -6,6 +6,7 @@ import (
 	mygrpc "myGprc"
 	"myGprc/client"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -27,13 +28,14 @@ func startServer(addr chan string) {
 		log.Fatal("rpc server:register error:", err)
 	}
 
-	listener, err := net.Listen("tcp", ":0")
+	listener, err := net.Listen("tcp", ":9999")
 	if err != nil {
 		log.Fatal("network error:", err)
 	}
 	log.Println("start rpc server on", listener.Addr())
+	mygrpc.HandleHTTP()
 	addr <- listener.Addr().String()
-	mygrpc.Accept(listener)
+	_ = http.Serve(listener, nil)
 }
 
 func TestReflect() {
@@ -76,8 +78,8 @@ func call(addchan <-chan string) {
 			defer wg.Done()
 			args := &Args{Num1: i, Num2: i * i}
 			var reply int
-			ctx, _ := context.WithTimeout(context.Background(), time.Second)
-			if err := client.Call(ctx, "Foo.Sum", args, &reply); err != nil {
+			//ctx, _ := context.WithTimeout(context.Background(), time.Second)
+			if err := client.Call(context.Background(), "Foo.Sum", args, &reply); err != nil {
 				log.Fatal("Call Foo.Sum error:", err)
 			}
 			log.Printf("%d + %d= %d \n", args.Num1, args.Num2, reply)

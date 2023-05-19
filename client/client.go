@@ -106,6 +106,7 @@ type Client struct {
 
 var ErrShutdown = errors.New("connection is shut down")
 
+// NewHTTPClient在NewClient基础上先发送了CONNECT请求，再接收返回
 func NewHTTPClient(conn net.Conn, opt *mygrpc.Option) (*Client, error) {
 	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", dafaultRPCPath))
 

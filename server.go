@@ -211,6 +211,7 @@ func (s *Server) Accept(lis net.Listener) {
 	}
 }
 
+// 实现HTTPHandler接口
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "CONNECT" {
 		w.Header().Set("content-Type", "text/plain; charset=utf-8")
@@ -225,7 +226,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	_, _ = io.WriteString(conn, "HTTP/1.0"+connected+"\n\n")
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
 	s.Serve(conn)
 }
 
