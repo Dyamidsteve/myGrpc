@@ -60,14 +60,8 @@ func TestReflect() {
 	}
 }
 
-func main() {
-	//TestReflect()
-
-	log.SetFlags(0)
-	addr := make(chan string)
-	go startServer(addr)
-
-	client, _ := client.Dial("tcp", <-addr)
+func call(addchan <-chan string) {
+	client, _ := client.DialHTTP("tcp", <-addchan)
 	defer client.Close()
 	//defer func() {_ = conn.Close()}()
 
@@ -91,4 +85,16 @@ func main() {
 	}
 
 	wg.Wait()
+}
+
+func main() {
+	//TestReflect()
+
+	log.SetFlags(0)
+	addrch := make(chan string)
+	go call(addrch)
+
+	// 主协程调用server，服务启动则一直等待，若是之前子协程则客户端结束服务端也结束了
+	startServer(addrch)
+
 }

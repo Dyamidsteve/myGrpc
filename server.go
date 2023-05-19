@@ -231,6 +231,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 func (s *Server) HandleHTTP() {
 	http.Handle(dafaultRPCPath, s)
+	http.Handle(defaultDebugPath, debugHTTP{s})
+	log.Println("rpc server debug path:", defaultDebugPath)
 }
 
 func HandleHTTP() {
