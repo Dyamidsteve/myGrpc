@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	mygrpc "myGprc"
+	"myGprc/registry"
 	"myGprc/xclient"
 	"net"
 	"net/http"
@@ -26,18 +27,28 @@ func (f Foo) Sleep(args Args, reply *int) error {
 	return nil
 }
 
-func startServer(addrCh chan string) {
+// 开启注册中心服务
+func startRegistry(wg *sync.WaitGroup) {
+	lis, _ := net.Listen("tcp", ":9999")
+	registry.HandleHTTP()
+	wg.Done()
+	_ = http.Serve(lis, nil)
+}
+
+// 开启服务端
+func startServer(registryAddr string, wg *sync.WaitGroup) {
 	var foo Foo
 	lis, err := net.Listen("tcp", ":0")
 	if err != nil {
 		log.Fatal("network error:", err)
 	}
 	log.Println("start rpc server on", lis.Addr())
-	addrCh <- lis.Addr().String()
 	server := mygrpc.NewServer()
 	_ = server.Register(&foo)
+	// 隔一段时间发送心跳，来告诉注册中心自己还提供着服务
+	registry.Heartbeat(registryAddr, "tcp@"+lis.Addr().String(), 0)
+	wg.Done()
 	server.Accept(lis)
-
 }
 
 func startHTTPServer(addr chan string) {
@@ -73,8 +84,9 @@ func foo(xc *xclient.XClient, ctx context.Context, typ, serviceMethod string, ar
 	}
 }
 
-func call(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+// 客户端调用call方法demo
+func call(registry string) {
+	d := xclient.NewGeeRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer xc.Close()
 
@@ -91,8 +103,9 @@ func call(addr1, addr2 string) {
 	wg.Wait()
 }
 
-func broadcast(addr1, addr2 string) {
-	d := xclient.NewMultiServerDiscovery([]string{"tcp@" + addr1, "tcp@" + addr2})
+// 客户端调用broadcast方法demo
+func broadcast(registry string) {
+	d := xclient.NewGeeRegistryDiscovery(registry, 0)
 	xc := xclient.NewXClient(d, xclient.RandomSelect, nil)
 	defer xc.Close()
 
@@ -140,15 +153,24 @@ func main() {
 	//TestReflect()
 
 	log.SetFlags(0)
-	ch1, ch2 := make(chan string), make(chan string)
-	go startServer(ch1)
-	go startServer(ch2)
+	registryAddr := "http://localhost:9999/_geerpc_/registry"
 
-	addr1 := <-ch1
-	addr2 := <-ch2
+	var wg sync.WaitGroup
 
+	//先启动注册中心
+	wg.Add(1)
+	go startRegistry(&wg)
+	wg.Wait()
+
+	//再启动RPC服务端
+	wg.Add(2)
+	go startServer(registryAddr, &wg)
+	go startServer(registryAddr, &wg)
+	wg.Wait()
+
+	//最后客户端远程调用
 	time.Sleep(time.Second)
-	call(addr1, addr2)
-	broadcast(addr1, addr2)
+	call(registryAddr)
+	broadcast(registryAddr)
 
 }

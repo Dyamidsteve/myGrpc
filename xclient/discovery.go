@@ -70,7 +70,8 @@ func (d *MultiServerDiscovery) Get(mode SelectMode) (string, error) {
 	switch mode {
 	case RandomSelect:
 		//随机选择
-		return d.servers[d.r.Intn(n)], nil
+		s := d.servers[d.r.Intn(n)]
+		return s, nil
 	case RoundRobinSelect:
 		//轮询算法（非加权轮询）
 		s := d.servers[d.index%n]
